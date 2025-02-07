@@ -4,6 +4,7 @@ set(CHEETAH_LIB_CMAKEFILES_DIR "${CMAKE_CURRENT_BINARY_DIR}${CMAKE_FILES_DIRECTO
 set(CHEETAH_SOURCES
   cilk2c.c
   cilk2c_inlined.c
+  cilk_set_affinity.c
   debug.c
   fiber.c
   fiber-pool.c
