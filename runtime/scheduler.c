@@ -1380,6 +1380,8 @@ static void do_what_it_says(ReadyDeque *deques, __cilkrts_worker *w,
     } while (t);
 }
 
+static inline void boss_scheduler(__cilkrts_worker *w);
+
 // Thin wrapper around do_what_it_says to allow the boss thread to execute the
 // Cilk computation until it would enter the work-stealing loop.
 void do_what_it_says_boss(__cilkrts_worker *w, Closure *t) {
@@ -1395,18 +1397,79 @@ void do_what_it_says_boss(__cilkrts_worker *w, Closure *t) {
 
     CILK_STOP_TIMING(w, INTERVAL_SCHED);
     worker_change_state(w, WORKER_IDLE);
-    worker_scheduler(w);
+    boss_scheduler(w);
 }
 
-void worker_scheduler(__cilkrts_worker *w) {
-    Closure *t = NULL;
-    CILK_ASSERT_POINTER_EQUAL(w, __cilkrts_get_tls_worker());
+static inline void boss_scheduler(__cilkrts_worker *w) {
+    global_state *const rts = w->g;
 
     CILK_START_TIMING(w, INTERVAL_SCHED);
     worker_change_state(w, WORKER_SCHED);
+
+    history_t history = {
+        .inefficient_history = 0,
+        .efficient_history = 0,
+        .sentinel_count_history_tail = 0,
+        .recent_sentinel_count = SENTINEL_COUNT_HISTORY,
+        .fails = init_fails(w->l->wake_val, rts),
+        .sample_threshold = SENTINEL_THRESHOLD,
+        .sentinel_count_history = { 1 },
+    };
+
+    worker_scheduler(w, &history);
+
+#if ENABLE_THIEF_SLEEP
+    reset_fails(rts, history.fails);
+#endif
+    CILK_STOP_TIMING(w, INTERVAL_SCHED);
+    worker_change_state(w, WORKER_IDLE);
+    __builtin_longjmp(rts->boss_ctx, 1);
+}
+
+static inline void non_boss_scheduler(__cilkrts_worker *w) {
+    CILK_START_TIMING(w, INTERVAL_SCHED);
+    worker_change_state(w, WORKER_SCHED);
+    global_state *const rts = w->g;
+    history_t history = {
+        .inefficient_history = 0,
+        .efficient_history = 0,
+        .sentinel_count_history_tail = 0,
+        .recent_sentinel_count = SENTINEL_COUNT_HISTORY,
+        .fails = init_fails(w->l->wake_val, rts),
+        .sample_threshold = SENTINEL_THRESHOLD,
+        .sentinel_count_history = { 1 },
+    };
+
+    while (!rts->terminate) {
+        worker_scheduler(w, &history);
+
+       // If it appears the computation is done, busy-wait for a while
+       // before exiting the work-stealing loop, in case another cilkified
+       // region is started soon.
+       unsigned int busy_fail = 0;
+       while (busy_fail++ < BUSY_LOOP_SPIN &&
+              atomic_load_explicit(&rts->done, memory_order_relaxed)) {
+           busy_pause();
+       }
+       if (thief_should_wait(rts)) {
+           break;
+       }
+    }
+
+#if ENABLE_THIEF_SLEEP
+    reset_fails(rts, history.fails);
+#endif
+
+    CILK_STOP_TIMING(w, INTERVAL_SCHED);
+    worker_change_state(w, WORKER_IDLE);
+}
+
+void worker_scheduler(__cilkrts_worker *w, history_t *const history) {
+    Closure *t = NULL;
+    CILK_ASSERT_POINTER_EQUAL(w, __cilkrts_get_tls_worker());
+
     global_state *rts = w->g;
     worker_id self = w->self;
-    const bool is_boss = (0 == self);
 
     // Get this worker's local_state pointer, to avoid rereading it
     // unnecessarily during the work-stealing loop.  This optimization helps
@@ -1419,16 +1482,16 @@ void worker_scheduler(__cilkrts_worker *w) {
     unsigned int nworkers = rts->nworkers;
 
     // Initialize count of consecutive failed steal attempts.
-    unsigned int fails = init_fails(l->wake_val, rts);
-    unsigned int sample_threshold = SENTINEL_THRESHOLD;
+    unsigned int fails = history->fails;
+    unsigned int sample_threshold = history->sample_threshold;
     // Local history information of the state of the system, for sentinel
     // workers to use to determine when to disengage and how many workers to
     // reengage.
-    history_t inefficient_history = 0;
-    history_t efficient_history = 0;
-    unsigned int sentinel_count_history[SENTINEL_COUNT_HISTORY] = { 1 };
-    unsigned int sentinel_count_history_tail = 0;
-    unsigned int recent_sentinel_count = SENTINEL_COUNT_HISTORY;
+    history_sample_t inefficient_history = history->inefficient_history;
+    history_sample_t efficient_history = history->efficient_history;
+
+    unsigned int sentinel_count_history_tail = history->sentinel_count_history_tail;
+    unsigned int recent_sentinel_count = history->recent_sentinel_count;
 
     // Get pointers to the local and global copies of the index-to-worker map.
     worker_id *index_to_worker = rts->index_to_worker;
@@ -1439,7 +1502,7 @@ void worker_scheduler(__cilkrts_worker *w) {
         /* A worker entering the steal loop must have saved its reducer map into
            the frame to which it belongs. */
         CILK_ASSERT(!w->hyper_table ||
-                           (is_boss && atomic_load_explicit(
+                           (self == 0 && atomic_load_explicit(
                                            &rts->done, memory_order_acquire)));
 
         CILK_STOP_TIMING(w, INTERVAL_SCHED);
@@ -1514,7 +1577,7 @@ void worker_scheduler(__cilkrts_worker *w) {
             fails = go_to_sleep_maybe(
                 rts, self, nworkers, NAP_THRESHOLD, w, t, fails,
                 &sample_threshold, &inefficient_history, &efficient_history,
-                sentinel_count_history, &sentinel_count_history_tail,
+                history->sentinel_count_history, &sentinel_count_history_tail,
                 &recent_sentinel_count);
 
             if (!t) {
@@ -1595,33 +1658,17 @@ void worker_scheduler(__cilkrts_worker *w) {
             }
 #endif // ENABLE_THIEF_SLEEP
             t = NULL;
-        } else if (!is_boss &&
-                   atomic_load_explicit(&rts->done, memory_order_relaxed)) {
-            // If it appears the computation is done, busy-wait for a while
-            // before exiting the work-stealing loop, in case another cilkified
-            // region is started soon.
-            unsigned int busy_fail = 0;
-            while (busy_fail++ < BUSY_LOOP_SPIN &&
-                   atomic_load_explicit(&rts->done, memory_order_relaxed)) {
-                busy_pause();
-            }
-            if (thief_should_wait(rts)) {
-                break;
-            }
         }
     }
-
-    // Reset the fail count.
-#if ENABLE_THIEF_SLEEP
-    reset_fails(rts, fails);
-#endif
+    
     l->rand_next = rand_state;
+    history->fails = fails;
+    history->sample_threshold = sample_threshold;
+    history->inefficient_history = inefficient_history;
+    history->efficient_history = efficient_history;
 
-    CILK_STOP_TIMING(w, INTERVAL_SCHED);
-    worker_change_state(w, WORKER_IDLE);
-    if (is_boss) {
-        __builtin_longjmp(rts->boss_ctx, 1);
-    }
+    history->sentinel_count_history_tail = sentinel_count_history_tail;
+    history->recent_sentinel_count = recent_sentinel_count;
 }
 
 void *scheduler_thread_proc(void *arg) {
@@ -1671,7 +1718,7 @@ void *scheduler_thread_proc(void *arg) {
         // Such operations, for example might have updated the left-most view of
         // a reducer.
         if (!atomic_load_explicit(&rts->done, memory_order_acquire)) {
-            worker_scheduler(w);
+            non_boss_scheduler(w);
         }
 
         CILK_START_TIMING(w, INTERVAL_SLEEP_UNCILK);
